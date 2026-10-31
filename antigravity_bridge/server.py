@@ -230,13 +230,6 @@ class TitaniumHandler(http.server.BaseHTTPRequestHandler):
                         "owned_by": "antigravity",
                         "description": f"{m['name']} ({m['desc']})"
                     })
-                    items.append({
-                        "id": m["alt_id"],
-                        "object": "model",
-                        "created": int(START_TIME),
-                        "owned_by": "antigravity",
-                        "description": f"{m['name']} ({m['desc']})"
-                    })
                 self.send_json_response({"object": "list", "data": items})
             elif self.path in ("/health", "/healthz"):
                 cid = get_active_cid()
