@@ -233,37 +233,14 @@ def handle_internal_command(cmd_text: str) -> str:
     return None
 
 
-def dispatch_prompt(user_content: str, requested_model: str = "", timeout: int = 60):
+def prepare_antigravity_dispatch(user_content: str, model_info: dict) -> tuple:
     """
-    Dispatch prompt to Antigravity CLI and retrieve generated response and thinking.
-    Thread-safe with deduplication to prevent double conversation creation.
-    Returns: (reply_text, thinking_text, latency_ms, model_id)
+    Thread-safe invocation of Antigravity CLI.
+    Returns (cid, start_lines).
     """
-    t0 = time.time()
     agentapi_cmd, use_shell = get_agentapi_cmd()
-
-    # Check for internal slash commands first
-    cmd_response = handle_internal_command(user_content)
-    if cmd_response is not None:
-        latency_ms = int((time.time() - t0) * 1000)
-        resolved_info = resolve_model(requested_model)
-        return cmd_response, "", latency_ms, resolved_info["id"]
-
-    # Resolve target model
-    model_info = resolve_model(requested_model)
     model_id = model_info["id"]
     model_tier = model_info["tier"]
-
-    # Deduplication check
-    req_hash = hashlib.sha256(f"{model_id}:{user_content}".encode("utf-8")).hexdigest()
-    now = time.time()
-    with SESSION_LOCK:
-        if req_hash in RECENT_DISPATCHES:
-            ts, cached_res = RECENT_DISPATCHES[req_hash]
-            if now - ts < 4.0:
-                log(f"Duplicate request detected within {now - ts:.2f}s. Debouncing to prevent double conversation.")
-                return cached_res
-
     brain = find_brain_dir()
 
     with SESSION_LOCK:
@@ -291,20 +268,51 @@ def dispatch_prompt(user_content: str, requested_model: str = "", timeout: int =
             except Exception as e:
                 log(f"Failed to parse new conversation response: {e}")
                 increment_metric("total_errors", 1)
-                return "Failed to initialize conversation session with Antigravity CLI.", "", 0, model_id
+                return None, 0
 
             if not cid:
                 increment_metric("total_errors", 1)
-                return "Failed to obtain conversation ID from Antigravity CLI.", "", 0, model_id
+                return None, 0
 
-            start_lines = 0
+            return cid, 0
         else:
             start_lines = get_transcript_line_count(cid)
             log(f"Sending message to persistent session {cid} ({model_info['name']})...")
             cmd = agentapi_cmd + ["send-message", cid, user_content]
             subprocess.run(cmd, capture_output=True, text=True, shell=use_shell)
+            return cid, start_lines
 
-    # Poll for response and reasoning
+
+def dispatch_prompt(user_content: str, requested_model: str = "", timeout: int = 60):
+    """
+    Dispatch prompt to Antigravity CLI for non-streaming requests.
+    Thread-safe with deduplication to prevent double conversation creation.
+    Returns: (reply_text, thinking_text, latency_ms, model_id)
+    """
+    t0 = time.time()
+
+    cmd_response = handle_internal_command(user_content)
+    if cmd_response is not None:
+        latency_ms = int((time.time() - t0) * 1000)
+        resolved_info = resolve_model(requested_model)
+        return cmd_response, "", latency_ms, resolved_info["id"]
+
+    model_info = resolve_model(requested_model)
+    model_id = model_info["id"]
+
+    req_hash = hashlib.sha256(f"{model_id}:{user_content}".encode("utf-8")).hexdigest()
+    now = time.time()
+    with SESSION_LOCK:
+        if req_hash in RECENT_DISPATCHES:
+            ts, cached_res = RECENT_DISPATCHES[req_hash]
+            if now - ts < 4.0:
+                log(f"Duplicate request detected within {now - ts:.2f}s. Debouncing to prevent double conversation.")
+                return cached_res
+
+    cid, start_lines = prepare_antigravity_dispatch(user_content, model_info)
+    if not cid:
+        return "Failed to initialize conversation session with Antigravity CLI.", "", 0, model_id
+
     reply, thinking, latency_ms = poll_for_response(cid, start_lines, timeout=timeout)
     if reply:
         record_history(cid, "user", user_content, 0)

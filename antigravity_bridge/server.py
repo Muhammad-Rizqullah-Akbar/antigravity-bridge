@@ -33,8 +33,11 @@ from antigravity_bridge.engine import (
     list_brain_sessions,
     resolve_model,
     extract_clean_prompt,
+    handle_internal_command,
+    prepare_antigravity_dispatch,
     START_TIME,
 )
+from antigravity_bridge.tailer import live_stream_transcript, stream_tokens_from_text
 
 
 def validate_request_auth(headers) -> tuple:
@@ -204,12 +207,38 @@ class BridgeRequestHandler(http.server.BaseHTTPRequestHandler):
                 requested_model = data.get("model", "")
 
                 user_content, system_guidance = extract_clean_prompt(messages)
-
-                assistant_reply, thinking, latency_ms, active_model_id = dispatch_prompt(
-                    user_content, requested_model=requested_model
-                )
                 completion_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
 
+                # 1. Internal Command Interception
+                cmd_response = handle_internal_command(user_content.strip())
+                if cmd_response is not None:
+                    increment_metric("total_requests", 1)
+                    if stream:
+                        self.send_response(200)
+                        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                        self.send_header("Cache-Control", "no-cache")
+                        self.send_header("Connection", "close")
+                        self.end_headers()
+                        for chunk_data in stream_tokens_from_text(cmd_response, completion_id, model_name=requested_model or DEFAULT_MODEL_KEY):
+                            self.wfile.write(chunk_data.encode("utf-8"))
+                            self.wfile.flush()
+                    else:
+                        resp_payload = {
+                            "id": completion_id,
+                            "object": "chat.completion",
+                            "created": int(time.time()),
+                            "model": requested_model or DEFAULT_MODEL_KEY,
+                            "choices": [{"index": 0, "message": {"role": "assistant", "content": cmd_response}, "finish_reason": "stop"}],
+                            "usage": {"prompt_tokens": len(user_content.split()), "completion_tokens": len(cmd_response.split()), "total_tokens": len(user_content.split()) + len(cmd_response.split())}
+                        }
+                        self.send_json_response(resp_payload)
+                    return
+
+                # 2. Model Selection
+                model_info = resolve_model(requested_model or get_config("default_model", DEFAULT_MODEL_KEY))
+                model_id = model_info["id"]
+
+                # 3. Stream vs Non-Stream Dispatch
                 if stream:
                     self.send_response(200)
                     self.send_header("Content-Type", "text/event-stream; charset=utf-8")
@@ -217,12 +246,27 @@ class BridgeRequestHandler(http.server.BaseHTTPRequestHandler):
                     self.send_header("Connection", "close")
                     self.end_headers()
 
-                    for chunk_data in stream_tokens_from_text(
-                        assistant_reply, completion_id, model_name=active_model_id, thinking=thinking
-                    ):
-                        self.wfile.write(chunk_data.encode("utf-8"))
-                        self.wfile.flush()
+                    cid, start_lines = prepare_antigravity_dispatch(user_content, model_info)
+                    if not cid:
+                        err_msg = "Failed to initialize conversation session with Antigravity Engine."
+                        for c in stream_tokens_from_text(err_msg, completion_id, model_name=model_id):
+                            self.wfile.write(c.encode("utf-8"))
+                            self.wfile.flush()
+                        return
+
+                    generator = live_stream_transcript(cid, start_lines, completion_id, model_name=model_id, timeout=65)
+                    try:
+                        for chunk_str in generator:
+                            self.wfile.write(chunk_str.encode("utf-8"))
+                            self.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError):
+                        log("Client disconnected during live streaming.")
+
+                    increment_metric("total_requests", 1)
                 else:
+                    assistant_reply, thinking, latency_ms, active_model_id = dispatch_prompt(
+                        user_content, requested_model=requested_model
+                    )
                     message_payload = {
                         "role": "assistant",
                         "content": assistant_reply
