@@ -32,6 +32,7 @@ from antigravity_bridge.engine import (
     dispatch_prompt,
     list_brain_sessions,
     resolve_model,
+    extract_clean_prompt,
     START_TIME,
 )
 
@@ -202,19 +203,7 @@ class BridgeRequestHandler(http.server.BaseHTTPRequestHandler):
                 stream = data.get("stream", False)
                 requested_model = data.get("model", "")
 
-                user_content = ""
-                for msg in reversed(messages):
-                    if msg.get("role") == "user":
-                        c = msg.get("content", "")
-                        if isinstance(c, list):
-                            parts = [p.get("text", "") for p in c if isinstance(p, dict) and p.get("type") == "text"]
-                            user_content = " ".join(parts)
-                        else:
-                            user_content = str(c)
-                        break
-
-                if not user_content.strip():
-                    user_content = "Hello Antigravity Bridge"
+                user_content, system_guidance = extract_clean_prompt(messages)
 
                 assistant_reply, thinking, latency_ms, active_model_id = dispatch_prompt(
                     user_content, requested_model=requested_model

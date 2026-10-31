@@ -43,25 +43,36 @@ def get_db_path() -> Path:
     return get_data_dir() / "bridge.db"
 
 
+def find_language_server_path() -> str:
+    """Locate language_server native binary on Windows/Linux/macOS if present."""
+    home = Path.home()
+    candidates = [
+        home / "AppData" / "Local" / "Programs" / "antigravity" / "resources" / "bin" / "language_server.exe",
+        Path("C:/Program Files/antigravity/resources/bin/language_server.exe"),
+        home / ".local" / "share" / "antigravity" / "bin" / "language_server",
+        Path("/usr/local/share/antigravity/bin/language_server"),
+    ]
+    for c in candidates:
+        if c.is_file():
+            return str(c)
+    return ""
+
+
 def find_agentapi_path() -> str:
     """
     Locate Antigravity agentapi binary across Windows, Linux, and macOS.
     """
-    # 1. Check explicit environment override
     custom = os.environ.get("ANTIGRAVITY_AGENTAPI_PATH")
     if custom and os.path.exists(custom):
         return custom
 
-    # 2. Check standard Antigravity CLI installation paths
     home = Path.home()
     candidates = [
-        # Windows standard installation
         home / ".gemini" / "antigravity" / "bin" / "agentapi.bat",
         home / ".gemini" / "antigravity" / "bin" / "agentapi.cmd",
         home / ".gemini" / "antigravity" / "bin" / "agentapi.exe",
         home / ".gemini" / "antigravity" / "bin" / "agy.bat",
         home / ".gemini" / "antigravity" / "bin" / "agy.exe",
-        # Unix / macOS standard installation
         home / ".gemini" / "antigravity" / "bin" / "agentapi",
         home / ".gemini" / "antigravity" / "bin" / "agy",
         home / ".local" / "bin" / "agentapi",
@@ -74,21 +85,30 @@ def find_agentapi_path() -> str:
         if candidate.is_file():
             return str(candidate)
 
-    # 3. Check system PATH
     found = shutil.which("agentapi") or shutil.which("agy")
     if found:
         return found
 
-    # Fallback to default expected path for current OS
     if sys.platform == "win32":
         return str(home / ".gemini" / "antigravity" / "bin" / "agentapi.bat")
     return str(home / ".gemini" / "antigravity" / "bin" / "agentapi")
 
 
+def get_agentapi_cmd() -> tuple:
+    """
+    Return (cmd_list, use_shell).
+    Prefers direct language_server binary on Windows to avoid cmd.exe multiline argument truncation.
+    """
+    native = find_language_server_path()
+    if native and os.path.exists(native):
+        return [native, "agentapi"], False
+    agentapi = find_agentapi_path()
+    use_shell = True if sys.platform == "win32" and agentapi.endswith((".bat", ".cmd")) else False
+    return [agentapi], use_shell
+
+
 def find_brain_dir() -> Path:
-    """
-    Locate Antigravity brain storage directory containing conversation transcripts.
-    """
+    """Locate Antigravity brain storage directory containing conversation transcripts."""
     custom = os.environ.get("ANTIGRAVITY_BRAIN_DIR")
     if custom and os.path.isdir(custom):
         return Path(custom)
@@ -102,23 +122,18 @@ def find_brain_dir() -> Path:
         if c.is_dir():
             return c
 
-    # Return default expected path
     return home / ".gemini" / "antigravity" / "brain"
 
 
 def find_hermes_config_paths() -> list:
-    """
-    Find all Hermes config.yaml locations across global and profile paths.
-    """
+    """Find all Hermes config.yaml locations across global and profile paths."""
     home = Path.home()
     found = []
 
     candidates = [
-        # Unix / macOS or fallback
         home / ".hermes" / "config.yaml",
     ]
 
-    # Windows AppData
     if sys.platform == "win32":
         local_app_data = os.environ.get("LOCALAPPDATA")
         if local_app_data:
@@ -132,7 +147,6 @@ def find_hermes_config_paths() -> list:
                         if p_conf.is_file():
                             candidates.append(p_conf)
 
-    # Check ~/.hermes/profiles as well
     unix_profiles = home / ".hermes" / "profiles"
     if unix_profiles.is_dir():
         for profile in unix_profiles.iterdir():

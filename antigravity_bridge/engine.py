@@ -1,6 +1,6 @@
 """
 Dispatch engine and conversation orchestrator for Antigravity Bridge.
-Handles command interception, model tier selection, and zero-splitting session flow.
+Handles command interception, model tier selection, deduplication, and zero-splitting session flow.
 """
 
 import os
@@ -8,6 +8,8 @@ import json
 import time
 import subprocess
 import re
+import threading
+import hashlib
 from antigravity_bridge.constants import (
     OFFICIAL_MODELS,
     DEFAULT_MODEL_KEY,
@@ -15,7 +17,7 @@ from antigravity_bridge.constants import (
     SERVER_NAME,
     SERVER_VERSION,
 )
-from antigravity_bridge.config import find_agentapi_path, find_brain_dir
+from antigravity_bridge.config import find_brain_dir, get_agentapi_cmd
 from antigravity_bridge.db import (
     log,
     get_config,
@@ -29,6 +31,8 @@ from antigravity_bridge.db import (
 from antigravity_bridge.tailer import get_transcript_line_count, poll_for_response
 
 START_TIME = time.time()
+SESSION_LOCK = threading.Lock()
+RECENT_DISPATCHES = {}
 
 
 def resolve_model(model_name: str) -> dict:
@@ -42,13 +46,41 @@ def resolve_model(model_name: str) -> dict:
         key = MODEL_LOOKUP[clean]
         return OFFICIAL_MODELS[key]
 
-    # Partial matching
     for key, info in OFFICIAL_MODELS.items():
         if key in clean or info["tier"] in clean:
             return info
 
     saved = get_config("default_model", DEFAULT_MODEL_KEY)
     return OFFICIAL_MODELS.get(saved, OFFICIAL_MODELS[DEFAULT_MODEL_KEY])
+
+
+def extract_clean_prompt(messages: list) -> tuple:
+    """
+    Extract pure user prompt and system guidance from messages payload.
+    Strips internal Hermes synthetic preambles so user questions are pristine.
+    """
+    raw_user_content = ""
+    system_text = ""
+
+    for msg in messages:
+        role = msg.get("role")
+        c = msg.get("content", "")
+        if isinstance(c, list):
+            parts = [p.get("text", "") for p in c if isinstance(p, dict) and p.get("type") == "text"]
+            text_val = " ".join(parts)
+        else:
+            text_val = str(c)
+
+        if role == "user":
+            raw_user_content = text_val.strip()
+        elif role == "system":
+            system_text = text_val.strip()
+
+    clean_user = re.sub(r"\[Note:\s*model was just switched[^\]]*\]\s*", "", raw_user_content).strip()
+    if not clean_user:
+        clean_user = raw_user_content.strip() or "Hello Antigravity"
+
+    return clean_user, system_text
 
 
 def list_brain_sessions(limit: int = 5) -> list:
@@ -93,10 +125,7 @@ def list_brain_sessions(limit: int = 5) -> list:
 
 
 def handle_internal_command(cmd_text: str) -> str:
-    """
-    Handle slash commands for model switching and session management.
-    Returns response string if handled, or None if not a recognized command.
-    """
+    """Handle slash commands for model switching and session management."""
     cmd = cmd_text.strip()
     lower = cmd.lower()
 
@@ -207,16 +236,11 @@ def handle_internal_command(cmd_text: str) -> str:
 def dispatch_prompt(user_content: str, requested_model: str = "", timeout: int = 60):
     """
     Dispatch prompt to Antigravity CLI and retrieve generated response and thinking.
+    Thread-safe with deduplication to prevent double conversation creation.
     Returns: (reply_text, thinking_text, latency_ms, model_id)
     """
     t0 = time.time()
-    agentapi = find_agentapi_path()
-
-    # Verify agentapi binary
-    if not os.path.exists(agentapi):
-        err = f"Antigravity CLI (agentapi) not found at: {agentapi}. Please verify installation."
-        log(err)
-        return err, "", 0, requested_model or "default"
+    agentapi_cmd, use_shell = get_agentapi_cmd()
 
     # Check for internal slash commands first
     cmd_response = handle_internal_command(user_content)
@@ -230,43 +254,55 @@ def dispatch_prompt(user_content: str, requested_model: str = "", timeout: int =
     model_id = model_info["id"]
     model_tier = model_info["tier"]
 
-    cid = get_active_cid()
-    fast_prompt = user_content.strip()
+    # Deduplication check
+    req_hash = hashlib.sha256(f"{model_id}:{user_content}".encode("utf-8")).hexdigest()
+    now = time.time()
+    with SESSION_LOCK:
+        if req_hash in RECENT_DISPATCHES:
+            ts, cached_res = RECENT_DISPATCHES[req_hash]
+            if now - ts < 4.0:
+                log(f"Duplicate request detected within {now - ts:.2f}s. Debouncing to prevent double conversation.")
+                return cached_res
 
-    # Initialize new conversation if no active session
-    if not cid:
-        clean_title = re.sub(r"[^\w\s-]", "", user_content[:28]).strip() or "Hermes Session"
-        cmd = [
-            agentapi,
-            "new-conversation",
-            "--title", clean_title,
-            "--model-tier", model_tier,
-            fast_prompt
-        ]
-        log(f"Initializing new Antigravity session: '{clean_title}' with {model_info['name']}...")
-        res = subprocess.run(cmd, capture_output=True, text=True, shell=True)
-        try:
-            out = json.loads(res.stdout)
-            cid = out.get("response", {}).get("newConversation", {}).get("conversationId")
-            if cid:
-                set_active_cid(cid, f"{model_info['name']}: {clean_title}", model=model_id)
-                set_config("default_model", model_info["alt_id"])
-        except Exception as e:
-            log(f"Failed to parse new conversation response: {e}")
-            increment_metric("total_errors", 1)
-            return "Failed to initialize conversation session with Antigravity CLI.", "", 0, model_id
+    brain = find_brain_dir()
+
+    with SESSION_LOCK:
+        cid = get_active_cid()
+        if cid and not (brain / cid).is_dir():
+            cid = ""
 
         if not cid:
-            increment_metric("total_errors", 1)
-            return "Failed to obtain conversation ID from Antigravity CLI.", "", 0, model_id
+            first_line = user_content.split("\n")[0].strip()
+            clean_title = re.sub(r"[^\w\s-]", "", first_line)[:28].strip() or f"Hermes {time.strftime('%m-%d %H:%M')}"
+            cmd = agentapi_cmd + [
+                "new-conversation",
+                f"--model={model_tier}",
+                f"--title={model_info['name']}: {clean_title}",
+                user_content
+            ]
+            log(f"Initializing single Antigravity session: '{clean_title}' with {model_info['name']}...")
+            res = subprocess.run(cmd, capture_output=True, text=True, shell=use_shell)
+            try:
+                out = json.loads(res.stdout)
+                cid = out.get("response", {}).get("newConversation", {}).get("conversationId")
+                if cid:
+                    set_active_cid(cid, f"{model_info['name']}: {clean_title}", model=model_id)
+                    set_config("default_model", model_info["alt_id"])
+            except Exception as e:
+                log(f"Failed to parse new conversation response: {e}")
+                increment_metric("total_errors", 1)
+                return "Failed to initialize conversation session with Antigravity CLI.", "", 0, model_id
 
-        start_lines = 0
-    else:
-        # Zero Session Splitting: Continue existing session
-        start_lines = get_transcript_line_count(cid)
-        log(f"Sending message to persistent session {cid} ({model_info['name']})...")
-        cmd = [agentapi, "send-message", cid, fast_prompt]
-        subprocess.run(cmd, capture_output=True, text=True, shell=True)
+            if not cid:
+                increment_metric("total_errors", 1)
+                return "Failed to obtain conversation ID from Antigravity CLI.", "", 0, model_id
+
+            start_lines = 0
+        else:
+            start_lines = get_transcript_line_count(cid)
+            log(f"Sending message to persistent session {cid} ({model_info['name']})...")
+            cmd = agentapi_cmd + ["send-message", cid, user_content]
+            subprocess.run(cmd, capture_output=True, text=True, shell=use_shell)
 
     # Poll for response and reasoning
     reply, thinking, latency_ms = poll_for_response(cid, start_lines, timeout=timeout)
@@ -276,9 +312,15 @@ def dispatch_prompt(user_content: str, requested_model: str = "", timeout: int =
         increment_metric("total_requests", 1)
         increment_metric("total_tokens", len(user_content.split()) + len(reply.split()))
         log(f"Extracted response from CID {cid} in {latency_ms/1000:.2f}s ({len(reply)} chars)")
-        return reply, thinking, latency_ms, model_id
+        result = (reply, thinking, latency_ms, model_id)
+        with SESSION_LOCK:
+            RECENT_DISPATCHES[req_hash] = (time.time(), result)
+        return result
 
     log(f"Polling timeout on CID {cid}")
     increment_metric("total_errors", 1)
     timeout_ms = int((time.time() - t0) * 1000)
-    return "Polling timeout reached on Antigravity Engine. Session remains intact in IDE.", "", timeout_ms, model_id
+    timeout_result = ("Polling timeout reached on Antigravity Engine. Session remains intact in IDE.", "", timeout_ms, model_id)
+    with SESSION_LOCK:
+        RECENT_DISPATCHES[req_hash] = (time.time(), timeout_result)
+    return timeout_result
