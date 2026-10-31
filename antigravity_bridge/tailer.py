@@ -105,6 +105,36 @@ def live_stream_transcript(cid, start_lines, completion_id, model_name="agb/gemi
     accumulated_content = ""
     accumulated_thinking = ""
     last_keepalive = time.time()
+    thinking_started = False
+
+    # 1. Announce assistant role immediately so client recognizes streaming start
+    role_chunk = {
+        "id": completion_id,
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": model_name,
+        "choices": [{
+            "index": 0,
+            "delta": {"role": "assistant", "content": ""},
+            "finish_reason": None
+        }]
+    }
+    yield f"data: {json.dumps(role_chunk, ensure_ascii=False)}\n\n"
+
+    # 2. Emit an immediate live status token so Telegram creates the message bubble on second 0
+    init_badge = "⚡ *[Mr. Robot Nucleus | Antigravity Engine Aktif...]*\n\n"
+    init_chunk = {
+        "id": completion_id,
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": model_name,
+        "choices": [{
+            "index": 0,
+            "delta": {"content": init_badge},
+            "finish_reason": None
+        }]
+    }
+    yield f"data: {json.dumps(init_chunk, ensure_ascii=False)}\n\n"
 
     while time.time() - t0 < timeout:
         if time.time() - last_keepalive >= 1.5:
@@ -146,6 +176,21 @@ def live_stream_transcript(cid, start_lines, completion_id, model_name="agb/gemi
                                     new_part = thinking
                                 accumulated_thinking = thinking
 
+                                if not thinking_started:
+                                    thinking_started = True
+                                    think_open = {
+                                        "id": completion_id,
+                                        "object": "chat.completion.chunk",
+                                        "created": int(time.time()),
+                                        "model": model_name,
+                                        "choices": [{
+                                            "index": 0,
+                                            "delta": {"content": "<think>\n", "reasoning_content": ""},
+                                            "finish_reason": None
+                                        }]
+                                    }
+                                    yield f"data: {json.dumps(think_open, ensure_ascii=False)}\n\n"
+
                                 for piece in re.split(r"(\s+)", new_part):
                                     if piece:
                                         chunk = {
@@ -155,19 +200,34 @@ def live_stream_transcript(cid, start_lines, completion_id, model_name="agb/gemi
                                             "model": model_name,
                                             "choices": [{
                                                 "index": 0,
-                                                "delta": {"reasoning_content": piece},
+                                                "delta": {"content": piece, "reasoning_content": piece},
                                                 "finish_reason": None
                                             }]
                                         }
                                         yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-                                        time.sleep(0.004)
+                                        time.sleep(0.003)
 
                             # 2. Stream live tool execution indicators directly into content for platform visibility
                             if tool_calls:
+                                if thinking_started:
+                                    thinking_started = False
+                                    think_close = {
+                                        "id": completion_id,
+                                        "object": "chat.completion.chunk",
+                                        "created": int(time.time()),
+                                        "model": model_name,
+                                        "choices": [{
+                                            "index": 0,
+                                            "delta": {"content": "\n</think>\n\n", "reasoning_content": ""},
+                                            "finish_reason": None
+                                        }]
+                                    }
+                                    yield f"data: {json.dumps(think_close, ensure_ascii=False)}\n\n"
+
                                 for tc in tool_calls:
                                     tc_summary = tc.get("args", {}).get("toolSummary", tc.get("name", "tool"))
                                     clean_summary = str(tc_summary).replace('"', '').strip()
-                                    status_badge = f"\n\n> *[Mr. Robot Operasi: {clean_summary}]*\n\n"
+                                    status_badge = f"\n\n> 🛠️ *[Mr. Robot Operasi: {clean_summary}]*\n\n"
                                     chunk = {
                                         "id": completion_id,
                                         "object": "chat.completion.chunk",
@@ -183,6 +243,21 @@ def live_stream_transcript(cid, start_lines, completion_id, model_name="agb/gemi
 
                             # 3. Stream final content words when ready
                             if content:
+                                if thinking_started:
+                                    thinking_started = False
+                                    think_close = {
+                                        "id": completion_id,
+                                        "object": "chat.completion.chunk",
+                                        "created": int(time.time()),
+                                        "model": model_name,
+                                        "choices": [{
+                                            "index": 0,
+                                            "delta": {"content": "\n</think>\n\n", "reasoning_content": ""},
+                                            "finish_reason": None
+                                        }]
+                                    }
+                                    yield f"data: {json.dumps(think_close, ensure_ascii=False)}\n\n"
+
                                 accumulated_content = content
                                 processed_lines.add(line_idx)
 
@@ -206,7 +281,7 @@ def live_stream_transcript(cid, start_lines, completion_id, model_name="agb/gemi
                                             }]
                                         }
                                         yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-                                        time.sleep(0.008)
+                                        time.sleep(0.006)
 
                                 # Final finish stop chunk
                                 stop_chunk = {
