@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "antigravity-bridge"
+version = "1.0.0"
+description = "Universal bridge connecting Hermes Agent with Google Antigravity models"
+readme = "README.md"
+authors = [
+    { name = "Muhammad Rizqullah Akbar", email = "inirizqullahakbar@gmail.com" }
+]
+license = { text = "MIT" }
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Communications :: Chat",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence"
+]
+requires-python = ">=3.9"
+dependencies = []
+
+[project.scripts]
+agb = "antigravity_bridge.cli:main"
+agb-connect = "antigravity_bridge.cli:init_cmd"
+antigravity-bridge = "antigravity_bridge.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["antigravity_bridge*"]
