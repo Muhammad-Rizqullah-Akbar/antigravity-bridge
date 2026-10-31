@@ -9,15 +9,20 @@ from pathlib import Path
 from antigravity_bridge.config import find_hermes_config_paths, get_api_key
 from antigravity_bridge.constants import DEFAULT_PORT, DEFAULT_HOST, OFFICIAL_MODELS
 
-PROVIDER_BLOCK = """    agb:
-      base_url: http://{host}:{port}/v1
-      api_key: {api_key}
-      discover_models: true
-      models:
-        - agb/gemini-4-argon
-        - agb/gemini-3.8-flash
-        - agb/claude-opus-5.5
-        - agb/claude-sonnet-5.5
+PROVIDER_BLOCK = """  agb:
+    name: agb
+    base_url: http://{host}:{port}/v1
+    api_key: {api_key}
+    discover_models: true
+    models:
+      agb/gemini-4-argon:
+        context_length: 1048576
+      agb/gemini-3.8-flash:
+        context_length: 1048576
+      agb/claude-opus-5.5:
+        context_length: 1048576
+      agb/claude-sonnet-5.5:
+        context_length: 1048576
 """
 
 
@@ -35,44 +40,21 @@ def patch_hermes_config(file_path: Path, host: str = DEFAULT_HOST, port: int = D
     api_key = get_api_key()
     provider_text = PROVIDER_BLOCK.format(host=host, port=port, api_key=api_key)
 
-    # Case 1: 'agb:' provider already present
-    if re.search(r"^\s*agb\s*:", content, flags=re.MULTILINE):
-        updated = False
-        # Ensure all 4 models are present
-        for m in OFFICIAL_MODELS.values():
-            m_id = m["id"]
-            if m_id not in content:
-                # Append missing model under agb models list
-                pattern = r"(agb:[\s\S]*?models:\s*\n)((?:\s*-\s*[^\n]+\n)*)"
-                match = re.search(pattern, content)
-                if match:
-                    prefix = match.group(1)
-                    existing = match.group(2)
-                    new_list = existing + f"        - {m_id}\n"
-                    content = content[:match.start()] + prefix + new_list + content[match.end():]
-                    updated = True
+    # Clean any malformed agb block first
+    cleaned = re.sub(r'    agb:[\s\S]*?(?=\n  [a-zA-Z0-9_-]+:|\n[a-zA-Z0-9_-]+:|$)', '', content)
+    cleaned = re.sub(r'  agb:[\s\S]*?(?=\n  [a-zA-Z0-9_-]+:|\n[a-zA-Z0-9_-]+:|$)', '', cleaned)
 
-        if updated:
-            with open(file_path, "w", encoding="utf-8") as f:
-                f.write(content)
-            return True
-        return False
+    if "providers:" in cleaned:
+        new_content = re.sub(r'(providers:\s*\n)', r'\1' + provider_text, cleaned, count=1)
+    else:
+        new_content = cleaned.rstrip() + "\nproviders:\n" + provider_text
 
-    # Case 2: 'providers:' section exists, add 'agb' under it
-    if re.search(r"^providers\s*:", content, flags=re.MULTILINE):
-        pattern = r"(^providers\s*:\s*\n)"
-        replacement = r"\1" + provider_text
-        new_content = re.sub(pattern, replacement, content, count=1, flags=re.MULTILINE)
+    if new_content != content:
         with open(file_path, "w", encoding="utf-8") as f:
             f.write(new_content)
         return True
 
-    # Case 3: 'providers:' does not exist, append section to the end
-    new_section = "\nproviders:\n" + provider_text
-    new_content = content.rstrip() + new_section + "\n"
-    with open(file_path, "w", encoding="utf-8") as f:
-        f.write(new_content)
-    return True
+    return False
 
 
 def auto_patch_all_hermes_configs(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> list:
