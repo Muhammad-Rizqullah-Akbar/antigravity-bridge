@@ -51,43 +51,99 @@ def check_new_artifacts(cid, known_artifacts=None):
     return new_found, known_artifacts
 
 
+def is_dangerous_tool_call(tc):
+    """Detects dangerous or destructive actions that require Hermes-style approval escalation."""
+    name = tc.get("name", "")
+    args = tc.get("args", {})
+    if name == "run_command":
+        cmd = str(args.get("CommandLine", "")).lower()
+        dangerous_patterns = [
+            (r"\brm\s+-[rf]+", "Penghapusan berkas rekursif (rm -rf)"),
+            (r"\bremove-item\b.*-recurse", "Penghapusan direktori rekursif (Remove-Item -Recurse)"),
+            (r"\bdel\s+/[sfq]+", "Penghapusan berkas sistem paksa (del /s /f /q)"),
+            (r"\brmdir\s+/[sfq]+", "Penghapusan direktori paksa (rmdir /s /q)"),
+            (r"\bgit\s+reset\s+--hard\b", "Operasi destruktif Git reset hard"),
+            (r"\bgit\s+clean\s+-[fd]+", "Pembersihan berkas tak terlacak Git clean"),
+            (r"\bgit\s+push\s+.*--force\b", "Paksaan Git push force overwrite"),
+            (r"\bdrop\s+(database|table)\b", "Penghapusan struktur basis data (DROP)"),
+            (r"\btruncate\s+(table)?\b", "Pengosongan tabel basis data (TRUNCATE)"),
+            (r"\bformat\s+[a-z]:", "Format disk penyimpanan"),
+            (r"\bmkfs\b", "Format filesystem (mkfs)"),
+            (r"\bshutdown\b", "Perintah mematikan sistem operasi"),
+            (r"\breboot\b", "Perintah restart sistem operasi"),
+            (r"\btaskkill\b.*/f\b.*/im\b", "Terminasi paksa proses sistem (taskkill /F)"),
+        ]
+        for pat, desc in dangerous_patterns:
+            if re.search(pat, cmd):
+                return True, desc
+    elif name in ("write_file", "edit_file"):
+        path = str(args.get("Path", "")).lower()
+        if any(sens in path for sens in [".ssh", "id_rsa", ".env", "passwd", "shadow"]):
+            return True, f"Modifikasi berkas sensitif / kredensial ({os.path.basename(path)})"
+    return False, ""
+
+
 def format_tool_call(tc):
-    """Formats tool calls with rich detail like an expert engineer working."""
+    """
+    Formats tool calls as explicit verbalized worker statements.
+    Ensures the agent narrates what it is searching for, what it is modifying, and alerts on dangerous actions.
+    """
     name = tc.get("name", "tool")
     args = tc.get("args", {})
     summary = clean_text_safety(str(args.get("toolSummary", "")).replace('"', '').strip())
     lines = []
 
-    if name == "run_command":
+    # 1. Approval escalation guard for dangerous actions
+    is_danger, danger_reason = is_dangerous_tool_call(tc)
+    if is_danger:
+        lines.append(f"> 🛑 **[ESKALASI PERSETUJUAN MAESTRO / APPROVAL REQUIRED]**")
+        lines.append(f"> ⚠️ **Tindakan Berisiko Tinggi Terdeteksi**: {danger_reason}")
+        lines.append(f"> ⏸️ *Operasi ditangguhkan sementara menunggu konfirmasi eksplisit Maestro.*")
+
+    # 2. Verbalized Worker Narrative
+    if name == "search_web":
+        query = clean_text_safety(str(args.get("query", "")).replace('"', '').strip())
+        domain = clean_text_safety(str(args.get("domain", "")).replace('"', '').strip())
+        dom_note = f" (domain target: `{domain}`)" if domain else ""
+        lines.append(f"> 🌐 **[Riset Web Aktif]**: \"Saya sedang melakukan penelusuran mengenai: `{query}`{dom_note} untuk menemukan referensi teknis yang valid...\"")
+    elif name in ("edit_file", "write_file"):
+        path = clean_text_safety(str(args.get("Path", "")).replace('"', '').strip())
+        fname = os.path.basename(path) or path
+        action_verb = "memodifikasi" if name == "edit_file" else "membuat"
+        lines.append(f"> 📝 **[Modifikasi Kode Aktif]**: \"Saya akan {action_verb} berkas `{fname}` untuk menerapkan penyesuaian logika yang presisi...\"")
+        if path:
+            lines.append(f"> ↳ *Lokasi Target*: `{path}`")
+    elif name == "read_file":
+        path = clean_text_safety(str(args.get("Path", "")).replace('"', '').strip())
+        fname = os.path.basename(path) or path
+        lines.append(f"> 📂 **[Pemeriksaan Berkas Aktif]**: \"Saya akan membaca dan menganalisis struktur kode di dalam `{fname}`...\"")
+        if path:
+            lines.append(f"> ↳ *Lokasi Berkas*: `{path}`")
+    elif name == "run_command":
         cmd = clean_text_safety(str(args.get("CommandLine", "")).replace('"', '').strip())
-        label = f"Eksekusi Shell: {summary}" if summary else "Eksekusi Shell"
-        lines.append(f"> 🛠️ **[{label}]**")
+        label = summary or "pemeriksaan sistem"
+        lines.append(f"> 🛠️ **[Eksekusi Shell Aktif]**: \"Saya akan menjalankan perintah shell untuk: {label}...\"")
         if cmd:
             display_cmd = cmd[:120] + ("..." if len(cmd) > 120 else "")
             lines.append(f"> `$ {display_cmd}`")
-    elif name in ("read_file", "edit_file", "write_file"):
-        path = clean_text_safety(str(args.get("Path", "")).replace('"', '').strip())
-        fname = os.path.basename(path) or path
-        action_map = {
-            "read_file": "Membaca Berkas",
-            "edit_file": "Memodifikasi Berkas",
-            "write_file": "Membuat Berkas"
-        }
-        lines.append(f"> 📂 **[{action_map.get(name, name)}]**: `{fname}`")
-        if path:
-            lines.append(f"> `Path: {path}`")
-    elif name == "search_web":
-        query = clean_text_safety(str(args.get("query", "")).replace('"', '').strip())
-        lines.append(f"> 🌐 **[Riset Web]**: `{query}`")
+    elif name == "ask_question":
+        questions = args.get("questions", [])
+        lines.append(f"> ❓ **[PERMINTAAN PERSETUJUAN / PERTANYAAN MAESTRO]**")
+        for q_item in questions:
+            q_text = clean_text_safety(str(q_item.get("question", "")).strip())
+            opts = [clean_text_safety(str(o).strip()) for o in q_item.get("options", [])]
+            lines.append(f"> *Pertanyaan*: **{q_text}**")
+            if opts:
+                lines.append(f"> *Pilihan Opsi*: " + " | ".join(f"`[{o}]`" for o in opts))
     elif name == "call_mcp_tool":
         server = clean_text_safety(str(args.get("ServerName", "")).strip())
         tool = clean_text_safety(str(args.get("ToolName", "")).strip())
-        lines.append(f"> 🔌 **[MCP Tool: {server} / {tool}]**")
+        lines.append(f"> 🔌 **[MCP Tool Aktif]**: \"Saya sedang memanggil perkakas eksternal `{tool}` pada server `{server}`...\"")
     elif name in ("manage_task", "invoke_subagent", "define_subagent"):
-        lines.append(f"> 🤖 **[Orkestrasi Agen / Task: {name}]**")
+        lines.append(f"> 🤖 **[Orkestrasi Sub-Agen Aktif]**: \"Saya sedang mengorkestrasikan agen spesialis untuk memperkuat eksekusi...\"")
     else:
         label = f"{name}: {summary}" if summary else name
-        lines.append(f"> ⚙️ **[Operasi: {label}]**")
+        lines.append(f"> ⚙️ **[Operasi Spesifik]**: \"Saya sedang menjalankan subrutin `{label}`...\"")
 
     return "\n".join(lines) + "\n"
 
@@ -104,24 +160,24 @@ def format_tool_result(content):
             raw_out = c[out_idx + len("Command output:"):].strip()
             first_lines = [l.strip() for l in raw_out.splitlines() if l.strip()][:2]
             snippet = " | ".join(first_lines)[:120] if first_lines else "Sukses tanpa output."
-            return f"> ↳ ✅ **Hasil (Exit 0)**: `{snippet}`\n\n"
-        return "> ↳ ✅ **Hasil (Exit 0)**: Operasi sukses dieksekusi.\n\n"
+            return f"> ↳ ✅ **Hasil Observasi (Exit 0)**: `{snippet}`\n\n"
+        return "> ↳ ✅ **Hasil Observasi (Exit 0)**: Operasi sukses dieksekusi.\n\n"
     elif "Command exited with code" in c:
         m = re.search(r"Command exited with code (\d+)", c)
         code = m.group(1) if m else "1"
-        return f"> ↳ ⚠️ **Hasil (Exit {code})**: Terdapat kendala eksekusi.\n\n"
+        return f"> ↳ ⚠️ **Hasil Observasi (Exit {code})**: Terdapat kendala eksekusi pada perintah.\n\n"
     elif "Showing lines" in c:
         m = re.search(r"Showing lines (\d+)-(\d+) of (\d+)", c)
         if m:
-            return f"> ↳ 📄 **Observasi**: Membaca baris {m.group(1)}-{m.group(2)} dari {m.group(3)} baris data.\n\n"
-        return "> ↳ 📄 **Observasi**: Isi berkas berhasil dibaca.\n\n"
+            return f"> ↳ 📄 **Hasil Observasi**: Membaca baris {m.group(1)}-{m.group(2)} dari total {m.group(3)} baris data.\n\n"
+        return "> ↳ 📄 **Hasil Observasi**: Isi berkas berhasil dibaca dan dipahami.\n\n"
     elif "Created file" in c:
-        return "> ↳ 💾 **Observasi**: Berkas berhasil dibuat dan disimpan.\n\n"
+        return "> ↳ 💾 **Hasil Observasi**: Berkas berhasil dibuat dan disimpan ke disk.\n\n"
     elif "Tool execution was canceled" in c:
-        return "> ↳ ⏹️ **Observasi**: Eksekusi dibatalkan.\n\n"
+        return "> ↳ ⏹️ **Hasil Observasi**: Eksekusi dibatalkan oleh pengawas sistem.\n\n"
     else:
         first_line = c.splitlines()[0][:100]
-        return f"> ↳ 📋 **Observasi**: `{first_line}`\n\n"
+        return f"> ↳ 📋 **Hasil Observasi**: `{first_line}`\n\n"
 
 
 def poll_for_response(cid, start_lines, timeout=60):
@@ -166,8 +222,8 @@ def poll_for_response(cid, start_lines, timeout=60):
 def live_stream_transcript(cid, start_lines, completion_id, model_name="agb/gemini-4-argon", timeout=65):
     """
     True Real-Time SSE Stream Generator.
-    Directly streams live thinking, tool operations, and token chunks as Antigravity executes.
-    Eliminates dead silence and matches the interactive experience of an expert remote engineer.
+    Directly streams live thinking, verbalized worker narratives, tool operations, and token chunks.
+    Matches the interactive experience of an elite remote engineer working in real time.
     """
     tpath = get_transcript_path(cid)
     t0 = time.time()
@@ -260,7 +316,7 @@ def live_stream_transcript(cid, start_lines, completion_id, model_name="agb/gemi
 
                                 if not thinking_started:
                                     thinking_started = True
-                                    think_header = "> 💭 **[Analisis Operasional]**:\n> "
+                                    think_header = "> 💭 **[Analisis & Rencana Operasional]**:\n> "
                                     chunk = {
                                         "id": completion_id,
                                         "object": "chat.completion.chunk",
@@ -291,7 +347,7 @@ def live_stream_transcript(cid, start_lines, completion_id, model_name="agb/gemi
                                         yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
                                         time.sleep(0.003)
 
-                            # 2. Stream tool calls with exact arguments and context
+                            # 2. Stream tool calls with verbalized statements and dangerous action approval alerts
                             if tool_calls:
                                 if thinking_started:
                                     thinking_started = False
